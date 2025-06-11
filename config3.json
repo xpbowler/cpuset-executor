@@ -1,0 +1,16 @@
+{
+    "outer_iters": 1000000,
+    "inner_iters": 3000,
+    "processes": [
+        {
+            "id": 1,
+            "threads": 30,
+            "cpu_request": 4
+        },
+        {
+            "id": 2,
+            "threads": 4,
+            "cpu_request": 4
+        }
+    ]
+}
