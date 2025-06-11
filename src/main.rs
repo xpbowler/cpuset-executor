@@ -8,20 +8,38 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::process::Stdio;
 use std::time::Instant;
+use std::collections::HashMap;
 
 const WEIGHT_PER_VCPU: f64 = 100.0;
 const TEST_SLICE: &str = "test.slice";
+const TRIALS: u8 = 10;
 
 #[derive(Clone, Copy)]
 pub struct BenchmarkResult {
     id: u64,
-    duration_milli: u64,
+    duration_millis: u64,
     cpu_usage_millis: u64
 }
 
 // Analyze benchmark results through several statistics
-fn analyze_benchmarks(benchmark_results: Vec<BenchmarkResult>){
+fn analyze_benchmarks(trial_results: Vec<Vec<BenchmarkResult>>){
+    let num_trials: u64 = trial_results.len() as u64; 
+    let mut id_to_results: HashMap<u64, BenchmarkResult> = HashMap::new();
+    for trial in trial_results {
+        for result in trial {
+            let entry = id_to_results.entry(result.id).or_insert_with(|| result.clone());
+            entry.cpu_usage_millis += result.cpu_usage_millis;
+            entry.duration_millis += result.duration_millis;
+        }
+    }
+    for (_,v) in id_to_results.iter_mut() {
+        v.cpu_usage_millis = v.cpu_usage_millis / num_trials;
+        v.duration_millis = v.duration_millis / num_trials;
+    }
 
+    for (k,v) in id_to_results.iter() {
+        println!("Process {}: duration_millis={}, cpu_usage_millis={}", k, v.duration_millis, v.cpu_usage_millis)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +48,7 @@ struct ProcessConfig {
     threads: u64,
     cpu_request: f64,
     cpu_affinity: Option<Vec<u8>>,
+    command: Option<Vec<String>>
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +125,7 @@ impl ProcessExecutor {
 
         let start_time = Instant::now();
         let scope = format!("p{}.scope", config.id);
+
         let mut cmd = tokio::process::Command::new("systemd-run");
         cmd
             .arg("--scope")
@@ -115,17 +135,25 @@ impl ProcessExecutor {
             .arg(&scope);
         Self::configure_cgroup(&mut cmd, &config).await?; // ProcessExecutor::configure_cgroup(&mut cmd, &config).await?; also works
 
-        cmd.arg("--")
-            .arg(std::env::current_exe()?)
-            .arg("worker")
-            .arg(config.threads.to_string()) // # threads == # cores used by process
-            .arg(outer_iters.to_string())
-            .arg(inner_iters.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        match config.command {
+            Some(v) => {
+                cmd.arg("--");
+                for s in v {
+                    cmd.arg(s);
+                }
+            }
+            None => {
+                cmd
+                    .arg("--")
+                    .arg(std::env::current_exe()?)
+                    .arg("worker")
+                    .arg(config.threads.to_string()) // # threads == # cores used by process
+                    .arg(outer_iters.to_string())
+                    .arg(inner_iters.to_string());
+            }
+        }
 
-        // TODO: set cpu affinity
-
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
         let cmd_output = cmd.spawn()?.wait_with_output().await?;
         if !cmd_output.status.success() {
@@ -146,7 +174,7 @@ impl ProcessExecutor {
         let cpu_usage_millis: u64 = cpu_usage_usec / 1000;
 
         Ok(BenchmarkResult{
-            duration_milli: duration.as_millis().try_into()?,
+            duration_millis: duration.as_millis().try_into()?,
             id: config.id,
             cpu_usage_millis: cpu_usage_millis
         })
@@ -172,7 +200,6 @@ fn run_worker(threads: u8, outer_iters: u64, inner_iters: u64) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-
     let args: Vec<String> = std::env::args().collect();
     if args.len()==5 && args[1].as_str() == "worker" {
         let threads: u8 = args[2].parse()?;
@@ -184,11 +211,14 @@ fn main() -> Result<()> {
         let config = parse_config_file(config_file_name)?;
         let process_executor = ProcessExecutor::from_config(config);
         let runtime = tokio::runtime::Runtime::new()?;
-        let benchmark_results = runtime.block_on(process_executor.execute_all())?;
-        for benchmark_result in benchmark_results.iter() {
-            println!("Process {}: duration_millis={}, cpu_usage_millis={}", benchmark_result.id, benchmark_result.duration_milli, benchmark_result.cpu_usage_millis);
+        
+        let mut trial_results: Vec<Vec<BenchmarkResult>> = vec![];
+        // run TRIALS number of trials
+        for _ in 0..TRIALS {
+            let ret = runtime.block_on(process_executor.execute_all())?;
+            trial_results.push(ret);
         }
-        analyze_benchmarks(benchmark_results);
+        analyze_benchmarks(trial_results);
         Ok(())
     }
 }
