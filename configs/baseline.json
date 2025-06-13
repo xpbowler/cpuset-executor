@@ -1,18 +1,18 @@
 {
-    "outer_iters": 1000000,
+    "outer_iters": 5000000,
     "inner_iters": 3000,
     "processes": [
         {
             "id": 1,
-            "threads": 20,
-            "cpu_request": 4,
-            "cpu_affinity": [7,8,9,10,11,12,   13,14,15,16,17,18]
+            "threads": 1,
+            "cpu_request": 1,
+            "cpu_affinity": [0, 1,2]
         },
         {
             "id": 2,
-            "threads": 4,
-            "cpu_request": 4,
-            "cpu_affinity": [1,2,3,4,5,6,      13,14,15,16,17,18]
+            "threads": 3,
+            "cpu_request": 2,
+            "cpu_affinity": [0, 1,2]
         }
     ]
 }

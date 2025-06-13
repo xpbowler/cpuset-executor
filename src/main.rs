@@ -10,7 +10,7 @@ use std::process::Stdio;
 use std::time::Instant;
 use std::collections::HashMap;
 
-const WEIGHT_PER_VCPU: f64 = 100.0;
+const SHARES_PER_CPU: u64 = 1024;
 const TEST_SLICE: &str = "test.slice";
 const TRIALS: u8 = 10;
 
@@ -27,7 +27,7 @@ fn analyze_benchmarks(trial_results: Vec<Vec<BenchmarkResult>>){
     let mut id_to_results: HashMap<u64, BenchmarkResult> = HashMap::new();
     for trial in trial_results {
         for result in trial {
-            let entry = id_to_results.entry(result.id).or_insert_with(|| result.clone());
+            let entry = id_to_results.entry(result.id).or_insert_with(|| BenchmarkResult { id: result.id, duration_millis: 0, cpu_usage_millis: 0 });
             entry.cpu_usage_millis += result.cpu_usage_millis;
             entry.duration_millis += result.duration_millis;
         }
@@ -42,11 +42,16 @@ fn analyze_benchmarks(trial_results: Vec<Vec<BenchmarkResult>>){
     }
 }
 
+pub fn cpu_shares_to_weight(shares: u64) -> u64 {
+    // https://github.com/google/gvisor/blob/676b9db40f430143d01123d124c3806e61fce7fa/runsc/cgroup/cgroup_v2.go#L742
+    1 + ((shares - 2) * 9999) / 262142
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessConfig {
     id: u64,
     threads: u64,
-    cpu_request: f64,
+    cpu_request: u64,
     cpu_affinity: Option<Vec<u8>>,
     command: Option<Vec<String>>
 }
@@ -83,10 +88,12 @@ impl ProcessExecutor {
             let config = process_config.clone();
             let outer_iters = self.outer_iters;
             let inner_iters = self.inner_iters;
+            println!("Spawning {}",config.id);
             tasks.push((tokio::spawn(async move {
                 let result = Self::execute_process(config, outer_iters, inner_iters).await;
                 result
-            }),process_config.id))
+            }),process_config.id));
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         }
 
         for (task, id) in tasks {
@@ -100,7 +107,7 @@ impl ProcessExecutor {
     }
 
     async fn configure_cgroup(cmd: &mut tokio::process::Command, config: &ProcessConfig) -> Result<()> {
-        let cpu_weight = WEIGHT_PER_VCPU * config.cpu_request; // 1 core == 100 cpu.weight
+        let cpu_weight = cpu_shares_to_weight(SHARES_PER_CPU * config.cpu_request);
         let cpuset_cpus = match &config.cpu_affinity {
             Some(cpus) => cpus.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","),
             None => "".to_string()
@@ -121,9 +128,7 @@ impl ProcessExecutor {
     }
 
     async fn execute_process(config: ProcessConfig, outer_iters: u64, inner_iters: u64) -> Result<BenchmarkResult> {
-        println!("Starting process: {}", config.id);
 
-        let start_time = Instant::now();
         let scope = format!("p{}.scope", config.id);
 
         let mut cmd = tokio::process::Command::new("systemd-run");
@@ -152,15 +157,16 @@ impl ProcessExecutor {
                     .arg(inner_iters.to_string());
             }
         }
-
         cmd.stdout(Stdio::null()).stderr(Stdio::piped());
 
+        let start_time = Instant::now();
         let cmd_output = cmd.spawn()?.wait_with_output().await?;
+        let duration = start_time.elapsed();
+
         if !cmd_output.status.success() {
             anyhow::bail!("Child process {} failed: {}", config.id, String::from_utf8(cmd_output.stderr)?);
         }
 
-        let duration = start_time.elapsed();
 
         let cpu_stat_filename = format!("/sys/fs/cgroup/{}/{}/cpu.stat",TEST_SLICE, scope);
         let cpu_stat_path = std::path::Path::new(cpu_stat_filename.as_str());
